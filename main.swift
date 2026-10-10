@@ -10,7 +10,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var caffeinateProcess: Process?
     var timer: Timer?
-    var remainingSeconds: Int = 0
+    /// When the current awake period ends. The countdown is derived from this
+    /// rather than decremented, so it stays correct even if timer ticks are
+    /// delayed or skipped.
+    var awakeUntil: Date?
     var timerMenuItem: NSMenuItem?
     var launchAtLoginItem: NSMenuItem?
 
@@ -75,6 +78,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// rather than trusting what we cached at launch.
     func menuWillOpen(_ menu: NSMenu) {
         refreshLaunchAtLoginItem()
+        if awakeUntil != nil {
+            updateTimerDisplay()
+        }
+    }
+
+    /// Covers termination paths other than the Quit item (logout, `NSApp`
+    /// terminate requests). Kills and crashes are covered by `caffeinate -w`.
+    func applicationWillTerminate(_ notification: Notification) {
+        stopAwake()
     }
 
     // MARK: - Launch at login
@@ -180,32 +192,77 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopAwake()
 
         let seconds = sender.tag
-        remainingSeconds = seconds
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
-        process.arguments = ["-dimu", "-t", "\(seconds)"]
-        try? process.run()
+        // `-w <pid>` ties caffeinate to this app's lifetime, so a force-quit,
+        // crash or `pkill` cannot leave an orphan keeping the Mac awake.
+        process.arguments = [
+            "-dimu",
+            "-t", "\(seconds)",
+            "-w", "\(ProcessInfo.processInfo.processIdentifier)",
+        ]
+        // Return the UI to Idle whenever caffeinate exits on its own (timeout,
+        // killed externally). A deliberate stopAwake() clears
+        // caffeinateProcess first, so the identity check makes this a no-op.
+        process.terminationHandler = { [weak self] exited in
+            DispatchQueue.main.async {
+                guard let self = self, self.caffeinateProcess === exited else { return }
+                self.stopAwake()
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            presentCaffeinateFailure(error)
+            return
+        }
         caffeinateProcess = process
+        awakeUntil = Date().addingTimeInterval(TimeInterval(seconds))
 
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "cup.and.saucer.fill", accessibilityDescription: "AwakeBar Active")
         }
 
         updateTimerDisplay()
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.remainingSeconds -= 60
-            if let self = self, self.remainingSeconds <= 0 {
+        let tick = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.remainingSeconds <= 0 {
                 self.stopAwake()
             } else {
-                self?.updateTimerDisplay()
+                self.updateTimerDisplay()
             }
         }
+        // .common keeps the countdown ticking while the menu is open (menu
+        // tracking runs the loop in a mode the default mode excludes).
+        RunLoop.main.add(tick, forMode: .common)
+        timer = tick
+    }
+
+    var remainingSeconds: Int {
+        guard let end = awakeUntil else { return 0 }
+        return max(0, Int(end.timeIntervalSinceNow.rounded(.up)))
+    }
+
+    func presentCaffeinateFailure(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't keep the Mac awake"
+        alert.informativeText = """
+            /usr/bin/caffeinate failed to start: \(error.localizedDescription)
+            """
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     func updateTimerDisplay() {
-        let hours = remainingSeconds / 3600
-        let minutes = (remainingSeconds % 3600) / 60
+        // Round up to whole minutes so the menu never shows "0m remaining"
+        // while still active.
+        let totalMinutes = (remainingSeconds + 59) / 60
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
         if hours > 0 {
             timerMenuItem?.title = "Awake: \(hours)h \(minutes)m remaining"
         } else {
@@ -214,11 +271,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func stopAwake() {
-        caffeinateProcess?.terminate()
+        let process = caffeinateProcess
         caffeinateProcess = nil
+        if let process = process, process.isRunning {
+            process.terminate()
+        }
         timer?.invalidate()
         timer = nil
-        remainingSeconds = 0
+        awakeUntil = nil
         timerMenuItem?.title = "Idle"
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "cup.and.saucer", accessibilityDescription: "AwakeBar")
