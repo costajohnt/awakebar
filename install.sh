@@ -51,6 +51,11 @@ codesign --force \
     "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
+if [ "${SKIP_LAUNCH:-0}" = "1" ]; then
+    echo "==> Built and signed (SKIP_LAUNCH=1, not launching)"
+    exit 0
+fi
+
 echo "==> Launching"
 open "$APP"
 
