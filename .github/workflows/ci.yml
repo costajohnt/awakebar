@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell scripts
+        run: bash -n install.sh && bash -n doctor.sh
+      - name: Build and sign the app bundle
+        env:
+          INSTALL_DIR: ${{ runner.temp }}/apps
+          SKIP_LAUNCH: "1"
+        run: ./install.sh
+      - name: Verify bundle
+        run: |
+          APP="$RUNNER_TEMP/apps/AwakeBar.app"
+          test -x "$APP/Contents/MacOS/AwakeBar"
+          codesign --verify --strict --verbose=2 "$APP"
+          plutil -lint "$APP/Contents/Info.plist"
